@@ -19,6 +19,7 @@ def parse_args():
     parser.add_argument("--num_cameras", type=int, default=100, help="Number of views to render.")
     parser.add_argument("--resolution", type=int, default=800, help="Resolution of the rendered images.")
     parser.add_argument("--radius", type=float, default=2.5, help="Radius of the camera hemisphere.")
+    parser.add_argument("--mode", type=str, choices=['static', 'video'], default='static', help="Acquisition mode.")
     
     return parser.parse_args(argv)
 
@@ -43,23 +44,53 @@ def import_mesh(filepath: str):
         raise ValueError(f"Unsupported file format: {ext}")
 
 def normalize_geometry():
-    """Centers and scales meshes using raw matrix math to bypass headless context bugs."""
+    """
+    Centers and scales meshes using true evaluated vertex bounds.
+    This guarantees mathematically perfect bounding boxes even for rigged/posed humans.
+    """
+    # 1. Get the current evaluation state (accounts for rigs and modifiers)
+    depsgraph = bpy.context.evaluated_depsgraph_get()
     meshes = [obj for obj in bpy.data.objects if obj.type == 'MESH']
+    
     if not meshes:
-        raise RuntimeError("No meshes found after import.")
+        return
 
-    # 1. Calculate global bounding box
     min_coords = Vector((float("inf"), float("inf"), float("inf")))
     max_coords = Vector((float("-inf"), float("-inf"), float("-inf")))
 
-    for mesh in meshes:
-        for corner in mesh.bound_box:
-            world_corner = mesh.matrix_world @ Vector(corner)
-            for i in range(3):
-                min_coords[i] = min(min_coords[i], world_corner[i])
-                max_coords[i] = max(max_coords[i], world_corner[i])
+    valid_bounds = False
 
-    # 2. Compute centroid and scale
+    for obj in meshes:
+        # 2. Get the evaluated object with all armatures/deformations applied
+        eval_obj = obj.evaluated_get(depsgraph)
+        
+        try:
+            # 3. Bake the evaluated object into a temporary raw mesh
+            eval_mesh = eval_obj.to_mesh()
+        except RuntimeError:
+            continue
+            
+        if not eval_mesh.vertices:
+            eval_obj.to_mesh_clear()
+            continue
+            
+        valid_bounds = True
+        world_matrix = obj.matrix_world
+        
+        # 4. Calculate bounds directly from true world-space vertex positions
+        for v in eval_mesh.vertices:
+            world_co = world_matrix @ v.co
+            for i in range(3):
+                if world_co[i] < min_coords[i]: min_coords[i] = world_co[i]
+                if world_co[i] > max_coords[i]: max_coords[i] = world_co[i]
+                
+        # Clear memory immediately to prevent RAM leaks during batch processing
+        eval_obj.to_mesh_clear()
+
+    if not valid_bounds:
+        return
+
+    # 5. Compute Centroid and Scale Factor
     centroid = (min_coords + max_coords) / 2.0
     dimensions = max_coords - min_coords
     max_dimension = max(dimensions)
@@ -69,13 +100,16 @@ def normalize_geometry():
 
     scale_factor = 1.0 / max_dimension
 
-    # 3. Apply math directly to avoid hierarchy scaling bugs
+    # 6. Apply matrix transformation
     T = Matrix.Translation(-centroid)
     S = Matrix.Scale(scale_factor, 4)
     
     for mesh in meshes:
         mesh.matrix_world = S @ T @ mesh.matrix_world
-
+        
+    # Force view layer update so the camera math in the next step sees the new positions
+    bpy.context.view_layer.update()
+    
 def setup_rendering(resolution: int):
     """Configures Cycles for headless GPU rendering and disables denoising."""
     scene = bpy.context.scene
@@ -151,6 +185,58 @@ def get_look_at_matrix(camera_location: Vector, target_location: Vector) -> Matr
     mat.translation = camera_location
     return mat
 
+# Video option
+def get_spiral_trajectory(num_frames: int, radius: float, loops: int = 5):
+    """Calculates continuous spiral coordinates for video rendering."""
+    coords = []
+    for i in range(num_frames):
+        t = i / (num_frames - 1)
+        z = t  # Hemisphere: 0 to 1
+        r_at_z = math.sqrt(1 - z**2)
+        theta = 2 * math.pi * loops * t
+        
+        x = math.cos(theta) * r_at_z
+        y = math.sin(theta) * r_at_z
+        coords.append(Vector((x * radius, y * radius, z * radius)))
+    return coords
+
+def render_video_dataset(output_dir: str, num_frames: int, radius: float):
+    """Renders a continuous spiral trajectory and exports frame metadata."""
+    os.makedirs(output_dir, exist_ok=True)
+    images_dir = os.path.join(output_dir, "images")
+    os.makedirs(images_dir, exist_ok=True)
+
+    cam_data = bpy.data.cameras.new("VideoCam")
+    cam_obj = bpy.data.objects.new("VideoCam", cam_data)
+    bpy.context.collection.objects.link(cam_obj)
+    bpy.context.scene.camera = cam_obj
+
+    # 5 loops provides significant parallax for gsplat
+    positions = get_spiral_trajectory(num_frames, radius, loops=5)
+    frames_json = []
+    origin = Vector((0.0, 0.0, 0.0))
+
+    for i, pos in enumerate(positions):
+        cam_obj.matrix_world = get_look_at_matrix(pos, origin)
+        bpy.context.view_layer.update()
+        
+        img_filename = f"frame_{i:04d}.png" # Padding for ffmpeg
+        bpy.context.scene.render.filepath = os.path.join(images_dir, img_filename)
+        
+        # Render frame
+        bpy.ops.render.render(write_still=True)
+
+        # Record extrinsic
+        matrix = cam_obj.matrix_world
+        frames_json.append({
+            "file_path": f"images/{img_filename}",
+            "transform_matrix": [list(matrix[row]) for row in range(4)]
+        })
+
+    # Export JSON so gsplat can still use these frames
+    with open(os.path.join(output_dir, "transforms.json"), "w") as f:
+        json.dump({"camera_angle_x": cam_data.angle_x, "frames": frames_json}, f, indent=4)
+
 def render_dataset(output_dir: str, num_cameras: int, radius: float):
     """Iterates through camera positions, renders, and extracts extrinsics."""
     os.makedirs(output_dir, exist_ok=True)
@@ -213,7 +299,10 @@ def main():
         images_dir = os.path.join(args.output, "images")
         os.makedirs(images_dir, exist_ok=True)
         
-        render_dataset(args.output, args.num_cameras, args.radius)
+        if args.mode == 'static':
+            render_dataset(args.output, args.num_cameras, args.radius)
+        else:
+            render_video_dataset(args.output, args.num_cameras, args.radius)
         
     except Exception as e:
         print(f"ERROR: {str(e)}", file=sys.stderr)

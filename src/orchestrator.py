@@ -1,6 +1,19 @@
 """
 Orchestrator for Synthetic Dataset Generation.
 Spawns headless Blender processes to render 3D meshes into image datasets.
+
+How to call the pipeline:
+conda activate obj-render
+python src/orchestrator.py \
+  --input_dir ./raw_meshes \
+  --output_dir ./datasets_video \
+  --blender_bin ./blender \
+  --worker_script ./src/blender_worker.py \
+  --max_workers 4 \
+  --mode video
+  
+If video mode is selected: 
+ffmpeg -framerate 30 -i images/frame_%04d.png -c:v libx264 -pix_fmt yuv420p output_video.mp4
 """
 
 import argparse
@@ -18,7 +31,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def process_mesh(mesh_path: Path, output_root: Path, blender_bin: Path, worker_script: Path) -> bool:
+def process_mesh(mesh_path: Path, output_root: Path, blender_bin: Path, worker_script: Path, mode: str) -> bool:
     """
     Executes a headless Blender instance to process a single mesh.
     """
@@ -35,7 +48,8 @@ def process_mesh(mesh_path: Path, output_root: Path, blender_bin: Path, worker_s
         "-P", str(worker_script),   # Execute specific Python script
         "--",                       # Argument separator for script
         "--input", str(mesh_path),
-        "--output", str(dataset_dir)
+        "--output", str(dataset_dir),
+        "--mode", mode 
     ]
 
     try:
@@ -56,6 +70,8 @@ def main():
     parser.add_argument("--blender_bin", type=Path, required=True, help="Path to the Blender executable.")
     parser.add_argument("--worker_script", type=Path, required=True, help="Path to blender_worker.py.")
     parser.add_argument("--max_workers", type=int, default=2, help="Number of concurrent Blender instances.")
+    parser.add_argument("--mode", type=str, choices=['static', 'video'], default='static', 
+                    help="Acquisition mode: 'static' (Fibonacci) or 'video' (Spiral).")
     
     args = parser.parse_args()
 
@@ -85,7 +101,7 @@ def main():
     successful_renders = 0
     with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
         futures = {
-            executor.submit(process_mesh, mesh, args.output_dir, args.blender_bin, args.worker_script): mesh 
+            executor.submit(process_mesh, mesh, args.output_dir, args.blender_bin, args.worker_script, args.mode): mesh 
             for mesh in meshes
         }
 
